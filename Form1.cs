@@ -5,15 +5,23 @@ using System.Runtime.InteropServices;
 using Microsoft.Win32;
 using System.Text.RegularExpressions;
 using System.Linq;
+using System.Collections.Generic;
 
 namespace PowerPointTextImporter
 {
     public partial class Form1 : Form
     {
         private dynamic pptApp;
+        private bool wasAlreadyOpen = false;
+        private dynamic currentPresentation = null;
+        private bool userExplicitlyDeclinedSave = false;
+        private bool userCanceled = false;
         private const string RegistryKey = @"Software\PowerPointTextImporter";
         private const string DontShowWarningValue = "DontShowWarning";
         private string selectedFilePath = string.Empty;
+        private FlowLayoutPanel previewPanel;
+        private List<CheckBox> slideCheckboxes;
+        private ToolTip tooltip;
 
         public Form1()
         {
@@ -36,6 +44,18 @@ namespace PowerPointTextImporter
             
             InitializeUI();
             ShowSecurityWarningIfNeeded();
+            
+            // Initialize the tooltip
+            tooltip = new ToolTip
+            {
+                InitialDelay = 0,
+                ReshowDelay = 0,
+                AutoPopDelay = 32000,  // Keep tooltip visible for longer
+                ShowAlways = true,
+                IsBalloon = true,
+                UseFading = false,  // Disable fading effect
+                UseAnimation = false  // Disable animation
+            };
         }
 
         private void ShowSecurityWarningIfNeeded()
@@ -109,32 +129,82 @@ namespace PowerPointTextImporter
 
         private void CleanupPowerPoint()
         {
-            if (pptApp != null)
+            if (currentPresentation != null)
             {
                 try
                 {
-                    // Check if PowerPoint is still running before trying to quit
-                    try
+                    if (!wasAlreadyOpen && !userExplicitlyDeclinedSave)
                     {
-                        var isOpen = pptApp.Visible;
-                        pptApp.Quit();
+                        // If presentation wasn't saved and we created it, ask one more time
+                        if (currentPresentation.Saved == false)
+                        {
+                            var saveResult = MessageBox.Show(
+                                "Do you want to save changes to the presentation?",
+                                "Save Changes",
+                                MessageBoxButtons.YesNoCancel,
+                                MessageBoxIcon.Question
+                            );
+
+                            if (saveResult == DialogResult.Yes)
+                            {
+                                using (var saveDialog = new SaveFileDialog())
+                                {
+                                    saveDialog.Filter = "PowerPoint Presentation (*.pptx)|*.pptx";
+                                    saveDialog.DefaultExt = "pptx";
+                                    saveDialog.AddExtension = true;
+
+                                    if (saveDialog.ShowDialog() == DialogResult.OK)
+                                    {
+                                        currentPresentation.SaveAs(saveDialog.FileName);
+                                    }
+                                    else
+                                    {
+                                        userCanceled = true; // User canceled the save dialog
+                                    }
+                                }
+                            }
+                            else if (saveResult == DialogResult.Cancel)
+                            {
+                                userCanceled = true;
+                            }
+                        }
                     }
-                    catch
+
+                    // Only release the presentation if we're not keeping PowerPoint open
+                    if (!userCanceled)
                     {
-                        // PowerPoint is already closed, ignore the error
+                        Marshal.FinalReleaseComObject(currentPresentation);
+                        currentPresentation = null;
                     }
                 }
-                finally
+                catch
                 {
-                    try
+                    // Ignore any COM errors during cleanup
+                }
+            }
+
+            if (pptApp != null && !userCanceled) // Only cleanup PowerPoint if not canceled
+            {
+                try
+                {
+                    if (!wasAlreadyOpen)
                     {
-                        Marshal.FinalReleaseComObject(pptApp);
+                        try
+                        {
+                            pptApp.Quit();
+                        }
+                        catch
+                        {
+                            // PowerPoint is already closed, ignore the error
+                        }
                     }
-                    catch
-                    {
-                        // Ignore any COM errors during cleanup
-                    }
+
+                    Marshal.FinalReleaseComObject(pptApp);
                     pptApp = null;
+                }
+                catch
+                {
+                    // Ignore any COM errors during cleanup
                 }
             }
         }
@@ -143,7 +213,7 @@ namespace PowerPointTextImporter
         {
             this.Text = "PowerPoint Text Importer";
             this.Width = 500;
-            this.Height = 200;
+            this.Height = 400;  // Increased height for preview
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
@@ -179,7 +249,66 @@ namespace PowerPointTextImporter
             };
             exampleButton.Click += Example_Click;
 
-            this.Controls.AddRange(new Control[] { selectFileButton, importButton, exampleButton, filePathLabel });
+            // Add preview panel
+            previewPanel = new FlowLayoutPanel
+            {
+                Location = new Point(20, 90),
+                Width = 440,
+                Height = 250,
+                AutoScroll = true,
+                BorderStyle = BorderStyle.FixedSingle,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                Visible = false
+            };
+
+            this.Controls.AddRange(new Control[] { selectFileButton, importButton, exampleButton, filePathLabel, previewPanel });
+            slideCheckboxes = new List<CheckBox>();
+        }
+
+        private class SlideValidationResult
+        {
+            public bool IsValid { get; set; }
+            public string Message { get; set; }
+            public string Title { get; set; }
+            public List<string> BulletPoints { get; set; }
+        }
+
+        private SlideValidationResult ValidateSlide(string slideText)
+        {
+            var result = new SlideValidationResult
+            {
+                IsValid = true,
+                BulletPoints = new List<string>()
+            };
+
+            // Validate title
+            var titleMatch = Regex.Match(slideText, @"Slide \d+:(.*?)(?=[\r\n]|$)");
+            if (!titleMatch.Success || string.IsNullOrWhiteSpace(titleMatch.Groups[1].Value))
+            {
+                result.IsValid = false;
+                result.Message = "Invalid slide title format";
+                result.Title = slideText.Split('\n')[0];
+                return result;
+            }
+            result.Title = titleMatch.Value.Trim();
+
+            // Extract and validate bullet points
+            var bulletPoints = Regex.Matches(slideText, @"^-\s*(.*?)$", RegexOptions.Multiline)
+                                  .Cast<Match>()
+                                  .Select(m => m.Groups[1].Value.Trim())
+                                  .Where(bp => !string.IsNullOrWhiteSpace(bp))
+                                  .ToList();
+
+            if (bulletPoints.Count == 0)
+            {
+                result.IsValid = false;
+                result.Message = "No bullet points found";
+                return result;
+            }
+
+            result.BulletPoints = bulletPoints;
+            return result;
         }
 
         private void SelectFile_Click(object sender, EventArgs e)
@@ -195,7 +324,133 @@ namespace PowerPointTextImporter
                     selectedFilePath = openFileDialog.FileName;
                     var filePathLabel = Controls.OfType<Label>().First();
                     filePathLabel.Text = $"Selected file: {System.IO.Path.GetFileName(selectedFilePath)}";
+                    UpdatePreview();
                 }
+            }
+        }
+
+        private void UpdatePreview()
+        {
+            try
+            {
+                string text = System.IO.File.ReadAllText(selectedFilePath);
+                
+                // First split by double newlines to separate potential slides
+                var slideTexts = text.Split(new[] { "\r\n\r\n", "\n\n" }, StringSplitOptions.RemoveEmptyEntries)
+                                   .Where(s => !string.IsNullOrWhiteSpace(s))
+                                   .ToList();
+
+                previewPanel.Controls.Clear();
+                slideCheckboxes.Clear();
+
+                var selectAllCheckbox = new CheckBox
+                {
+                    Text = "Select All Slides",
+                    Checked = true,
+                    AutoSize = true,
+                    Margin = new Padding(5)
+                };
+                selectAllCheckbox.CheckedChanged += (s, e) =>
+                {
+                    foreach (var cb in slideCheckboxes)
+                    {
+                        if (cb.Enabled) // Only change enabled checkboxes
+                            cb.Checked = selectAllCheckbox.Checked;
+                    }
+                };
+                previewPanel.Controls.Add(selectAllCheckbox);
+
+                foreach (string slideText in slideTexts)
+                {
+                    var validationResult = ValidateSlide(slideText);
+                    
+                    // Create panel for the slide preview row
+                    var slidePanel = new Panel
+                    {
+                        Width = previewPanel.Width - 20,
+                        Height = 30,
+                        Margin = new Padding(5),
+                        Cursor = validationResult.IsValid ? Cursors.Default : Cursors.Help,
+                        BackColor = Color.Transparent
+                    };
+
+                    // Add validation indicator
+                    var indicator = new Label
+                    {
+                        AutoSize = true,
+                        Location = new Point(0, 5),
+                        Text = validationResult.IsValid ? "✓" : "✗",
+                        ForeColor = validationResult.IsValid ? Color.Green : Color.Red,
+                        Font = new Font(Font.FontFamily, 10, FontStyle.Bold),
+                        Cursor = validationResult.IsValid ? Cursors.Default : Cursors.Help
+                    };
+                    slidePanel.Controls.Add(indicator);
+
+                    if (validationResult.IsValid)
+                    {
+                        // Add checkbox for valid slides
+                        var checkbox = new CheckBox
+                        {
+                            Text = validationResult.Title,
+                            Checked = true,
+                            AutoSize = true,
+                            Location = new Point(20, 5),
+                            Enabled = true,
+                            Cursor = Cursors.Default
+                        };
+                        slideCheckboxes.Add(checkbox);
+                        slidePanel.Controls.Add(checkbox);
+
+                        string tooltipText = $"Valid slide with {validationResult.BulletPoints.Count} bullet points:\n\n{string.Join("\n", validationResult.BulletPoints)}";
+                        tooltip.SetToolTip(indicator, tooltipText);
+                        tooltip.SetToolTip(checkbox, tooltipText);
+                    }
+                    else
+                    {
+                        // For invalid slides, use a label with checkbox appearance
+                        var checkboxLabel = new Label
+                        {
+                            Text = "☐ Invalid Format: " + slideText.Split('\n')[0].Trim(),
+                            AutoSize = true,
+                            Location = new Point(20, 5),
+                            Cursor = Cursors.Help
+                        };
+                        slidePanel.Controls.Add(checkboxLabel);
+                        
+                        // Add a disabled checkbox for tracking (invisible)
+                        var hiddenCheckbox = new CheckBox
+                        {
+                            Visible = false,
+                            Checked = false,
+                            Enabled = false
+                        };
+                        slideCheckboxes.Add(hiddenCheckbox);
+                        slidePanel.Controls.Add(hiddenCheckbox);
+
+                        string tooltipText = 
+$@"Error: {validationResult.Message}
+
+Expected format:
+Slide 1: Your Title
+- Bullet point 1
+- Bullet point 2
+
+Your text:
+{slideText.Trim()}";
+
+                        tooltip.SetToolTip(indicator, tooltipText);
+                        tooltip.SetToolTip(checkboxLabel, tooltipText);
+                        tooltip.SetToolTip(slidePanel, tooltipText);
+                    }
+
+                    previewPanel.Controls.Add(slidePanel);
+                }
+
+                previewPanel.Visible = true;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error previewing file: {ex.Message}", "Preview Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -233,38 +488,87 @@ namespace PowerPointTextImporter
         {
             try
             {
-                pptApp = Activator.CreateInstance(Type.GetTypeFromProgID("PowerPoint.Application"));
-                pptApp.Visible = true;
+                // Check if PowerPoint is already running
+                try
+                {
+                    pptApp = System.Runtime.InteropServices.Marshal.GetActiveObject("PowerPoint.Application");
+                    wasAlreadyOpen = true;
+                }
+                catch
+                {
+                    pptApp = Activator.CreateInstance(Type.GetTypeFromProgID("PowerPoint.Application"));
+                    wasAlreadyOpen = false;
+                }
 
-                dynamic presentation = pptApp.Presentations.Add();
+                pptApp.Visible = true;
+                currentPresentation = pptApp.Presentations.Add();
                 
                 // Split text into slides
-                var slideTexts = System.Text.RegularExpressions.Regex.Split(text, @"(?=Slide \d+:)").Where(s => !string.IsNullOrWhiteSpace(s));
+                var slideTexts = text.Split(new[] { "\r\n\r\n", "\n\n" }, StringSplitOptions.RemoveEmptyEntries)
+                                   .Where(s => !string.IsNullOrWhiteSpace(s))
+                                   .ToList();
 
-                foreach (string slideText in slideTexts)
+                for (int i = 0; i < slideTexts.Count; i++)
                 {
-                    // Extract slide title and content
-                    var titleMatch = System.Text.RegularExpressions.Regex.Match(slideText, @"Slide \d+:(.*?)(?=[\r\n]|$)");
-                    var bulletPoints = System.Text.RegularExpressions.Regex.Matches(slideText, @"^-\s*(.*?)$", System.Text.RegularExpressions.RegexOptions.Multiline)
-                                          .Cast<System.Text.RegularExpressions.Match>()
-                                          .Select(m => m.Groups[1].Value.Trim())
-                                          .ToList();
+                    // Skip if the corresponding checkbox is unchecked
+                    if (i < slideCheckboxes.Count && !slideCheckboxes[i].Checked)
+                        continue;
 
-                    if (titleMatch.Success)
+                    string slideText = slideTexts[i];
+                    var validationResult = ValidateSlide(slideText);
+                    
+                    // Skip invalid slides
+                    if (!validationResult.IsValid)
+                        continue;
+
+                    // Add new slide (index 2 is typically the Title and Content layout)
+                    dynamic slide = currentPresentation.Slides.Add(currentPresentation.Slides.Count + 1, 2);
+
+                    // Add title
+                    var title = validationResult.Title.Replace("Slide " + (i + 1) + ":", "").Trim();
+                    slide.Shapes.Title.TextFrame.TextRange.Text = title;
+
+                    // Add bullet points to the content placeholder
+                    var bodyShape = slide.Shapes.Item(2);
+                    var textRange = bodyShape.TextFrame.TextRange;
+                    textRange.Text = string.Join("\n", validationResult.BulletPoints);
+                }
+
+                // Ask user if they want to save the presentation
+                var saveResult = MessageBox.Show(
+                    "Would you like to save the presentation?",
+                    "Save Presentation",
+                    MessageBoxButtons.YesNoCancel,
+                    MessageBoxIcon.Question
+                );
+
+                if (saveResult == DialogResult.Yes)
+                {
+                    using (var saveDialog = new SaveFileDialog())
                     {
-                        // Add new slide (index 2 is typically the Title and Content layout)
-                        dynamic slide = presentation.Slides.Add(presentation.Slides.Count + 1, 2);
+                        saveDialog.Filter = "PowerPoint Presentation (*.pptx)|*.pptx";
+                        saveDialog.DefaultExt = "pptx";
+                        saveDialog.AddExtension = true;
 
-                        // Add title
-                        var title = titleMatch.Groups[1].Value.Trim();
-                        slide.Shapes.Title.TextFrame.TextRange.Text = title;
-
-                        // Add bullet points to the content placeholder
-                        var bodyShape = slide.Shapes.Item(2);
-                        var textRange = bodyShape.TextFrame.TextRange;
-                        // Remove the bullet point character since PowerPoint will add it automatically
-                        textRange.Text = string.Join("\n", bulletPoints);
+                        if (saveDialog.ShowDialog() == DialogResult.OK)
+                        {
+                            currentPresentation.SaveAs(saveDialog.FileName);
+                            MessageBox.Show("Presentation saved successfully!", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                            userExplicitlyDeclinedSave = true; // Mark as handled since we saved successfully
+                        }
+                        else
+                        {
+                            userCanceled = true; // User canceled the save dialog
+                        }
                     }
+                }
+                else if (saveResult == DialogResult.No)
+                {
+                    userExplicitlyDeclinedSave = true; // User explicitly chose not to save
+                }
+                else // Cancel
+                {
+                    userCanceled = true;
                 }
             }
             catch
